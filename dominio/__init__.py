@@ -1,0 +1,1 @@
+"""Reglas de negocio del bot de turnos."""

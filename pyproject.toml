@@ -1,0 +1,10 @@
+[project]
+name = "turnos-bot"
+version = "0.1.0"
+description = "Bot de Telegram para reservar turnos"
+requires-python = ">=3.11"
+dependencies = ["pyTelegramBotAPI>=4,<5", "tzdata>=2025.2"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

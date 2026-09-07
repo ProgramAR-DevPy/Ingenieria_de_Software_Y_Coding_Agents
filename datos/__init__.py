@@ -1,0 +1,1 @@
+"""Adaptadores de persistencia basados en SQLite."""
