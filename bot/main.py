@@ -1,16 +1,63 @@
 """Punto de entrada del bot de Telegram."""
 
-import os
+import logging
+import time
 from datetime import datetime
-from pathlib import Path
+from logging.handlers import RotatingFileHandler
+from typing import Callable
 
 import telebot
 from telebot.types import Message
 
+import contexto
+from config import config
 from datos.repositorio_sqlite import RepositorioTurnosSqlite
 from dominio.agenda import ZONA_HORARIA
 from dominio.errores import ErrorDeNegocio
 from dominio.servicio_turnos import ServicioDeTurnos
+
+UMBRAL_LENTITUD_SEGUNDOS = 5
+
+logger = logging.getLogger(__name__)
+
+
+class _FiltroCorrelacion(logging.Filter):
+    """Agrega el id de correlación vigente a cada registro de log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.id_correlacion = contexto.id_actual()
+        return True
+
+
+class _FormateadorConZonaHoraria(logging.Formatter):
+    """Formatea la fecha y hora del log en la zona horaria del negocio."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        instante = datetime.fromtimestamp(record.created, tz=ZONA_HORARIA)
+        return instante.strftime(datefmt or "%Y-%m-%d %H:%M:%S%z")
+
+
+def configurar_logging() -> None:
+    """Configura el logging de toda la aplicación. Se llama una sola vez, al arrancar."""
+    formateador = _FormateadorConZonaHoraria(
+        "%(asctime)s %(levelname)s [%(id_correlacion)s] %(name)s: %(message)s"
+    )
+    filtro = _FiltroCorrelacion()
+
+    manejadores: list[logging.Handler] = [logging.StreamHandler()]
+    if config.log_file:
+        config.log_file.parent.mkdir(parents=True, exist_ok=True)
+        manejadores.append(
+            RotatingFileHandler(
+                config.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+            )
+        )
+
+    for manejador in manejadores:
+        manejador.setFormatter(formateador)
+        manejador.addFilter(filtro)
+
+    logging.basicConfig(level=config.log_level, handlers=manejadores, force=True)
 
 
 def ahora_argentina() -> datetime:
@@ -24,13 +71,37 @@ def interpretar_inicio(texto: str) -> datetime:
     return fecha.replace(tzinfo=ZONA_HORARIA)
 
 
+def _responder(bot: telebot.TeleBot, mensaje: Message, texto: str) -> None:
+    """Responde al usuario, alertando si la llamada a Telegram tarda demasiado."""
+    inicio = time.monotonic()
+    bot.reply_to(mensaje, texto)
+    duracion = time.monotonic() - inicio
+    if duracion > UMBRAL_LENTITUD_SEGUNDOS:
+        logger.warning("Llamada a Telegram lenta. duracion_seg=%.1f", duracion)
+
+
+def _con_correlacion(manejador: Callable[[Message], None]) -> Callable[[Message], None]:
+    """Arranca un id de correlación nuevo y loguea excepciones inesperadas con traceback."""
+
+    def envoltorio(mensaje: Message) -> None:
+        contexto.nuevo_id()
+        try:
+            manejador(mensaje)
+        except Exception:
+            logger.exception("Error inesperado procesando chat_id=%s", mensaje.chat.id)
+
+    return envoltorio
+
+
 def crear_bot(token: str, servicio: ServicioDeTurnos) -> telebot.TeleBot:
     """Crea y registra los comandos del bot."""
     bot = telebot.TeleBot(token)
 
     @bot.message_handler(commands=["start", "ayuda"])
+    @_con_correlacion
     def mostrar_ayuda(mensaje: Message) -> None:
-        bot.reply_to(
+        _responder(
+            bot,
             mensaje,
             "Reserva turnos de lunes a viernes, de 09:00 a 18:00.\n\n"
             "/reservar AAAA-MM-DD HH:MM\n"
@@ -39,10 +110,11 @@ def crear_bot(token: str, servicio: ServicioDeTurnos) -> telebot.TeleBot:
         )
 
     @bot.message_handler(commands=["reservar"])
+    @_con_correlacion
     def reservar(mensaje: Message) -> None:
         partes = mensaje.text.split(maxsplit=1) if mensaje.text else []
         if len(partes) != 2:
-            bot.reply_to(mensaje, "Usa: /reservar AAAA-MM-DD HH:MM")
+            _responder(bot, mensaje, "Usa: /reservar AAAA-MM-DD HH:MM")
             return
         try:
             inicio = interpretar_inicio(partes[1])
@@ -53,50 +125,49 @@ def crear_bot(token: str, servicio: ServicioDeTurnos) -> telebot.TeleBot:
                 ahora_argentina(),
             )
         except ValueError:
-            bot.reply_to(mensaje, "Usa la fecha con formato AAAA-MM-DD HH:MM.")
+            _responder(bot, mensaje, "Usa la fecha con formato AAAA-MM-DD HH:MM.")
             return
         except ErrorDeNegocio as error:
-            bot.reply_to(mensaje, str(error))
+            _responder(bot, mensaje, str(error))
             return
-        bot.reply_to(mensaje, f"Turno reservado. ID: {turno.id}. Fecha: {turno.inicio:%d/%m/%Y %H:%M}.")
+        _responder(bot, mensaje, f"Turno reservado. ID: {turno.id}. Fecha: {turno.inicio:%d/%m/%Y %H:%M}.")
 
     @bot.message_handler(commands=["mis_turnos"])
+    @_con_correlacion
     def listar_turnos(mensaje: Message) -> None:
         turnos = servicio.listar_proximos(mensaje.from_user.id, ahora_argentina())
         if not turnos:
-            bot.reply_to(mensaje, "No tenes turnos proximos.")
+            _responder(bot, mensaje, "No tenes turnos proximos.")
             return
         texto = "\n".join(
             f"ID {turno.id}: {turno.inicio:%d/%m/%Y %H:%M}" for turno in turnos
         )
-        bot.reply_to(mensaje, texto)
+        _responder(bot, mensaje, texto)
 
     @bot.message_handler(commands=["cancelar"])
+    @_con_correlacion
     def cancelar(mensaje: Message) -> None:
         partes = mensaje.text.split(maxsplit=1) if mensaje.text else []
         try:
             turno_id = int(partes[1])
             servicio.cancelar(turno_id, mensaje.from_user.id)
         except (IndexError, ValueError):
-            bot.reply_to(mensaje, "Usa: /cancelar ID")
+            _responder(bot, mensaje, "Usa: /cancelar ID")
             return
         except ErrorDeNegocio as error:
-            bot.reply_to(mensaje, str(error))
+            _responder(bot, mensaje, str(error))
             return
-        bot.reply_to(mensaje, "Turno cancelado.")
+        _responder(bot, mensaje, "Turno cancelado.")
 
     return bot
 
 
 def ejecutar() -> None:
-    """Inicia el polling con el token de entorno."""
-    
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        raise RuntimeError("Defini la variable de entorno TELEGRAM_TOKEN antes de iniciar el bot.")
-    repositorio = RepositorioTurnosSqlite(Path("turnos.db"))
-    bot = crear_bot(token, ServicioDeTurnos(repositorio))
-    print("Bot iniciado")
+    """Inicia el polling con la configuración leída del entorno."""
+    configurar_logging()
+    repositorio = RepositorioTurnosSqlite(config.db_path)
+    bot = crear_bot(config.telegram_token, ServicioDeTurnos(repositorio))
+    logger.info("Bot iniciado")
     bot.infinity_polling(skip_pending=True)
 
 
