@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias (solo requirements.txt)
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Correr tests
+        run: pytest -v
+
+      - name: Verificar que el bot importe sin explotar
+        env:
+          TELEGRAM_TOKEN: "ci-placeholder"
+        run: python -c "import bot.main"

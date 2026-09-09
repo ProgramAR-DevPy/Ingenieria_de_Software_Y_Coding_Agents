@@ -6,7 +6,9 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Callable
 
+import requests
 import telebot
+from telebot.apihelper import ApiTelegramException
 from telebot.types import Message
 
 import contexto
@@ -17,6 +19,9 @@ from dominio.errores import ErrorDeNegocio
 from dominio.servicio_turnos import ServicioDeTurnos
 
 UMBRAL_LENTITUD_SEGUNDOS = 5
+MAX_INTENTOS_ENVIO = 3
+ESPERA_BASE_SEGUNDOS = 1
+CODIGOS_HTTP_TRANSITORIOS = (429, 500, 502, 503, 504)
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +76,47 @@ def interpretar_inicio(texto: str) -> datetime:
     return fecha.replace(tzinfo=ZONA_HORARIA)
 
 
+def _es_transitorio(error: Exception) -> bool:
+    """Indica si el error de Telegram vale la pena reintentar."""
+    if isinstance(error, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    if isinstance(error, ApiTelegramException) and error.error_code in CODIGOS_HTTP_TRANSITORIOS:
+        return True
+    return False
+
+
 def _responder(bot: telebot.TeleBot, mensaje: Message, texto: str) -> None:
-    """Responde al usuario, alertando si la llamada a Telegram tarda demasiado."""
+    """Responde al usuario, reintentando con espera creciente ante fallas transitorias."""
     inicio = time.monotonic()
-    bot.reply_to(mensaje, texto)
+    intento = 1
+    while True:
+        try:
+            bot.reply_to(mensaje, texto)
+            break
+        except Exception as error:
+            if not _es_transitorio(error):
+                raise
+            if intento >= MAX_INTENTOS_ENVIO:
+                logger.error(
+                    "Se agotaron los %s intentos de responder por Telegram. chat_id=%s error=%s",
+                    MAX_INTENTOS_ENVIO,
+                    mensaje.chat.id,
+                    error,
+                )
+                try:
+                    bot.reply_to(mensaje, "Estamos con problemas para responderte. Probá de nuevo en un momento.")
+                except Exception:
+                    pass
+                return
+            espera = ESPERA_BASE_SEGUNDOS * (2 ** (intento - 1))
+            logger.warning(
+                "Reintento %s/%s respondiendo por Telegram tras error transitorio: %s",
+                intento,
+                MAX_INTENTOS_ENVIO,
+                error,
+            )
+            time.sleep(espera)
+            intento += 1
     duracion = time.monotonic() - inicio
     if duracion > UMBRAL_LENTITUD_SEGUNDOS:
         logger.warning("Llamada a Telegram lenta. duracion_seg=%.1f", duracion)
